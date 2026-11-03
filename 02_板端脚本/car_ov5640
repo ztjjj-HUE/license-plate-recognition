@@ -1,0 +1,93 @@
+#!/bin/sh
+ROOT=/home/root/car_ov5640_v1
+ADDRESS=169.254.72.156
+PIDFILE=/var/run/car_ov5640.pid
+LOCK=/var/run/car_ov5640.lock
+PREPARED=/var/run/car_ov5640.prepared
+LOG=/var/log/car_ov5640.log
+
+prepare_hardware() {
+    if [ -r "$PREPARED" ]; then
+        return 0
+    fi
+    for app in psplash QMainApp; do
+        pids=$(pidof "$app" 2>/dev/null || true)
+        if [ -n "$pids" ]; then
+            kill $pids 2>/dev/null || true
+            count=0
+            while pidof "$app" >/dev/null 2>&1; do
+                [ "$count" -lt 10 ] || break
+                sleep 1
+                count=$((count + 1))
+            done
+        fi
+    done
+    devmem 0x41220000 32 7 2>/dev/null || true
+    devmem 0x41600040 32 10 2>/dev/null || true
+    devmem 0x41600120 32 15 2>/dev/null || true
+    devmem 0x41600100 32 2 2>/dev/null || true
+    devmem 0x41600100 32 1 2>/dev/null || true
+    devmem 0x41600028 32 11 2>/dev/null || true
+    devmem 0x4160001c 32 0x80000000 2>/dev/null || true
+    touch "$PREPARED"
+    return 0
+}
+
+supervise() {
+    child=
+    cleanup() {
+        trap - TERM INT EXIT
+        if [ -n "$child" ]; then
+            kill "$child" 2>/dev/null || true
+            wait "$child" 2>/dev/null || true
+        fi
+        rm -f "$PIDFILE"
+        rmdir "$LOCK" 2>/dev/null || true
+    }
+    trap 'exit 0' TERM INT
+    trap cleanup EXIT
+    echo "OV5640_HDMI_START $(date)"
+    cd "$ROOT" || return 1
+    prepare_hardware
+    python3 -m software.board.ov5640_ready || echo "OV5640_CAPTURE_RETRY..."
+    ip -4 addr show dev eth0 | grep -q "$ADDRESS/16" ||         ip addr add "$ADDRESS/16" dev eth0 || true
+    ip route show 192.168.2.0/24 | grep -q 'dev eth0' ||         ip route add 192.168.2.0/24 dev eth0 || true
+    echo "OV5640_HDMI_SERVICE_READY $ADDRESS:8767"
+    while :; do
+        python3 -m software.board.blue_tcp_server --bind "$ADDRESS"             --camera /dev/video0 --camera-backend ov5640 --hdmi-fb /dev/fb1 &
+        child=$!
+        wait "$child"
+        result=$?
+        child=
+        echo "OV5640_SESSION_END rc=$result $(date)"
+        sleep 2
+    done
+}
+
+case "$1" in
+    start)
+        [ -d "$ROOT/software/board" ] || exit 1
+        if [ -r "$PIDFILE" ]; then
+            read -r existing < "$PIDFILE"
+            kill -0 "$existing" 2>/dev/null && exit 0
+        fi
+        mkdir "$LOCK" 2>/dev/null || exit 1
+        "$0" supervise </dev/null >>"$LOG" 2>&1 &
+        printf '%s
+' "$!" > "$PIDFILE"
+        ;;
+    supervise) supervise ;;
+    stop)
+        if [ -r "$PIDFILE" ]; then
+            read -r existing < "$PIDFILE"
+            kill "$existing" 2>/dev/null || true
+            rm -f "$PIDFILE"
+        fi
+        ;;
+    status)
+        [ -r "$PIDFILE" ] || exit 1
+        read -r existing < "$PIDFILE"
+        kill -0 "$existing" 2>/dev/null
+        ;;
+    *) exit 2 ;;
+esac
